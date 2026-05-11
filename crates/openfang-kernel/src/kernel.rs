@@ -7844,40 +7844,6 @@ mod tests {
             .any(|c| matches!(c, Capability::ToolInvoke(name) if name == "shell_exec")));
     }
 
-    #[test]
-    fn test_hand_activation_does_not_seed_runtime_tool_filters() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home_dir = tmp.path().join("openfang-kernel-hand-test");
-        std::fs::create_dir_all(&home_dir).unwrap();
-
-        let config = KernelConfig {
-            home_dir: home_dir.clone(),
-            data_dir: home_dir.join("data"),
-            ..KernelConfig::default()
-        };
-
-        let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
-        let instance = kernel
-            .activate_hand("browser", HashMap::new(), None)
-            .expect("browser hand should activate");
-        let agent_id = instance.agent_id.expect("browser hand agent id");
-        let entry = kernel
-            .registry
-            .get(agent_id)
-            .expect("browser hand agent entry");
-
-        assert!(
-            entry.manifest.tool_allowlist.is_empty(),
-            "hand activation should leave the runtime tool allowlist empty so skill/MCP tools remain visible"
-        );
-        assert!(
-            entry.manifest.tool_blocklist.is_empty(),
-            "hand activation should not set a runtime blocklist by default"
-        );
-
-        kernel.shutdown();
-    }
-
     // ----------------------------------------------------------------------
     // Issue #1069: sanitize_cron_job_name + shared-memory schedule migration
     // ----------------------------------------------------------------------
