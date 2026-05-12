@@ -969,6 +969,25 @@ pub struct ExecPolicy {
     /// produce no stdout/stderr output for this duration. Default: 30.
     #[serde(default = "default_no_output_timeout")]
     pub no_output_timeout_secs: u64,
+    /// Environment variables to forward from the OpenFang process into
+    /// `shell_exec` subprocesses.
+    ///
+    /// By default, subprocesses run with `env_clear()` and only receive a
+    /// minimal safe set (PATH, HOME, TMPDIR, LANG, TERM, etc. — see
+    /// `subprocess_sandbox::SAFE_ENV_VARS`). Anything else — including
+    /// user-defined variables present in the container/host environment —
+    /// is stripped. This list lets operators explicitly re-add specific
+    /// variables to the subprocess environment.
+    ///
+    /// Each entry is an env var name. A single entry of `"*"` forwards
+    /// every variable present in the parent process. Use with care — `*`
+    /// will leak API keys and other secrets into child processes.
+    ///
+    /// Aliases `env_passthrough` and `env_allowlist` are accepted for
+    /// backwards compatibility with users who configured these names
+    /// before the field existed (issue #1169).
+    #[serde(default, alias = "env_passthrough", alias = "env_allowlist")]
+    pub shell_env_passthrough: Vec<String>,
 }
 
 fn default_no_output_timeout() -> u64 {
@@ -990,6 +1009,7 @@ impl Default for ExecPolicy {
             timeout_secs: 30,
             max_output_bytes: 100 * 1024,
             no_output_timeout_secs: default_no_output_timeout(),
+            shell_env_passthrough: Vec::new(),
         }
     }
 }
@@ -1461,6 +1481,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_auto_thread() -> String {
+    "false".to_string()
+}
+
 fn default_thread_ttl() -> u64 {
     24
 }
@@ -1909,6 +1933,13 @@ pub struct TelegramConfig {
     /// Allows channel_send(channel="telegram", message="...") without a recipient.
     #[serde(default)]
     pub default_chat_id: Option<String>,
+    /// Forum topic routing: maps `message_thread_id` to an agent name.
+    /// When a message arrives inside a Telegram forum topic whose thread id is
+    /// listed here, the bridge dispatches it to the named agent instead of the
+    /// default. Threads not listed fall back to `default_agent`.
+    /// Issue #780.
+    #[serde(default)]
+    pub thread_routes: HashMap<i64, String>,
     /// Per-channel behavior overrides.
     #[serde(default)]
     pub overrides: ChannelOverrides,
@@ -1923,6 +1954,7 @@ impl Default for TelegramConfig {
             poll_interval_secs: 1,
             api_url: None,
             default_chat_id: None,
+            thread_routes: HashMap::new(),
             overrides: ChannelOverrides::default(),
         }
     }
@@ -1956,6 +1988,10 @@ pub struct DiscordConfig {
     /// In these channels, the bot responds to all group messages without needing to be mentioned.
     #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub free_response_channels: Vec<String>,
+    /// Auto-thread behavior: "true" (always create thread), "false" (never), "smart" (only when @mentioned).
+    /// Default: "false"
+    #[serde(default = "default_auto_thread")]
+    pub auto_thread: String,
     /// Per-channel behavior overrides.
     #[serde(default)]
     pub overrides: ChannelOverrides,
@@ -1972,6 +2008,7 @@ impl Default for DiscordConfig {
             ignore_bots: true,
             default_channel_id: None,
             free_response_channels: vec![],
+            auto_thread: "false".to_string(),
             overrides: ChannelOverrides::default(),
         }
     }
@@ -2099,6 +2136,13 @@ pub struct MatrixConfig {
     pub user_id: String,
     /// Env var name holding the access token.
     pub access_token_env: String,
+    /// Env var name holding the MSC2918 refresh token (optional).
+    ///
+    /// When set, the adapter auto-recovers from `M_UNKNOWN_TOKEN` 401 responses
+    /// by calling `POST /_matrix/client/v3/refresh`. Required for matrix.org
+    /// since the 2025-04-07 migration to MAS (Matrix Authentication Service).
+    #[serde(default)]
+    pub refresh_token_env: Option<String>,
     /// Room IDs to listen in (empty = all joined rooms).
     #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub allowed_rooms: Vec<String>,
@@ -2118,6 +2162,7 @@ impl Default for MatrixConfig {
             homeserver_url: "https://matrix.org".to_string(),
             user_id: String::new(),
             access_token_env: "MATRIX_ACCESS_TOKEN".to_string(),
+            refresh_token_env: None,
             allowed_rooms: vec![],
             default_agent: None,
             auto_accept_invites: false,
@@ -4126,6 +4171,9 @@ mod tests {
         let mx = MatrixConfig::default();
         assert_eq!(mx.homeserver_url, "https://matrix.org");
         assert_eq!(mx.access_token_env, "MATRIX_ACCESS_TOKEN");
+        // MSC2918 refresh token env defaults to None; operators opt in via
+        // `refresh_token_env = "MATRIX_REFRESH_TOKEN"` in config.toml.
+        assert!(mx.refresh_token_env.is_none());
         assert!(mx.allowed_rooms.is_empty());
     }
 
@@ -4599,5 +4647,55 @@ mod tests {
         "#;
         let config: KernelConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.heartbeat.default_timeout_secs, 300);
+    }
+
+    // ── Issue #1169: shell_env_passthrough on ExecPolicy ──────────────
+
+    #[test]
+    fn test_exec_policy_passthrough_default_empty() {
+        let policy = ExecPolicy::default();
+        assert!(policy.shell_env_passthrough.is_empty());
+    }
+
+    #[test]
+    fn test_exec_policy_passthrough_deserializes() {
+        let toml_str = r#"
+mode = "full"
+shell_env_passthrough = ["TZ", "GOG_ACCOUNT"]
+"#;
+        let policy: ExecPolicy = toml::from_str(toml_str).unwrap();
+        assert_eq!(policy.shell_env_passthrough, vec!["TZ", "GOG_ACCOUNT"]);
+    }
+
+    #[test]
+    fn test_exec_policy_passthrough_alias_env_passthrough() {
+        // Backwards-compat alias from the issue body (#1169).
+        let toml_str = r#"
+mode = "full"
+env_passthrough = ["TZ", "GOG_ACCOUNT"]
+"#;
+        let policy: ExecPolicy = toml::from_str(toml_str).unwrap();
+        assert_eq!(policy.shell_env_passthrough, vec!["TZ", "GOG_ACCOUNT"]);
+    }
+
+    #[test]
+    fn test_exec_policy_passthrough_alias_env_allowlist() {
+        // Backwards-compat alias from the issue body (#1169).
+        let toml_str = r#"
+mode = "full"
+env_allowlist = ["TZ", "HOME"]
+"#;
+        let policy: ExecPolicy = toml::from_str(toml_str).unwrap();
+        assert_eq!(policy.shell_env_passthrough, vec!["TZ", "HOME"]);
+    }
+
+    #[test]
+    fn test_exec_policy_passthrough_wildcard() {
+        let toml_str = r#"
+mode = "full"
+shell_env_passthrough = ["*"]
+"#;
+        let policy: ExecPolicy = toml::from_str(toml_str).unwrap();
+        assert_eq!(policy.shell_env_passthrough, vec!["*"]);
     }
 }

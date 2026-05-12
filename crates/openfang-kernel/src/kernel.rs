@@ -288,9 +288,38 @@ impl DeliveryTracker {
     }
 }
 
-/// Create workspace directory structure for an agent.
+/// Create the agent's private state directory layout. Holds identity files,
+/// AGENT.json, sessions/, memory/, and logs/. Lives under
+/// `~/.openfang/workspaces/{name}/` regardless of where the user pointed the
+/// user-facing workspace. See issue #1097.
+fn ensure_state_dir(state_dir: &Path, workspace: &Path) -> KernelResult<()> {
+    for subdir in &["sessions", "logs", "memory"] {
+        std::fs::create_dir_all(state_dir.join(subdir)).map_err(|e| {
+            KernelError::OpenFang(OpenFangError::Internal(format!(
+                "Failed to create state dir {}/{subdir}: {e}",
+                state_dir.display()
+            )))
+        })?;
+    }
+    // Write agent metadata file (best-effort).
+    let meta = serde_json::json!({
+        "created_at": chrono::Utc::now().to_rfc3339(),
+        "state_dir": state_dir.display().to_string(),
+        "workspace": workspace.display().to_string(),
+    });
+    let _ = std::fs::write(
+        state_dir.join("AGENT.json"),
+        serde_json::to_string_pretty(&meta).unwrap_or_default(),
+    );
+    Ok(())
+}
+
+/// Create the user-facing workspace layout. Only `data/`, `output/`, and
+/// `skills/` are scaffolded here. When the user points the workspace at a
+/// pre-existing path like `~/Documents`, these subdirs are created lazily
+/// inside it without dumping identity files or sessions. See issue #1097.
 fn ensure_workspace(workspace: &Path) -> KernelResult<()> {
-    for subdir in &["data", "output", "sessions", "skills", "logs", "memory"] {
+    for subdir in &["data", "output", "skills"] {
         std::fs::create_dir_all(workspace.join(subdir)).map_err(|e| {
             KernelError::OpenFang(OpenFangError::Internal(format!(
                 "Failed to create workspace dir {}/{subdir}: {e}",
@@ -298,15 +327,6 @@ fn ensure_workspace(workspace: &Path) -> KernelResult<()> {
             )))
         })?;
     }
-    // Write agent metadata file (best-effort)
-    let meta = serde_json::json!({
-        "created_at": chrono::Utc::now().to_rfc3339(),
-        "workspace": workspace.display().to_string(),
-    });
-    let _ = std::fs::write(
-        workspace.join("AGENT.json"),
-        serde_json::to_string_pretty(&meta).unwrap_or_default(),
-    );
     Ok(())
 }
 
@@ -447,15 +467,18 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
 }
 
 /// Append an assistant response summary to the daily memory log (best-effort, append-only).
-/// Caps daily log at 1MB to prevent unbounded growth.
-fn append_daily_memory_log(workspace: &Path, response: &str) {
+/// Caps daily log at 1MB to prevent unbounded growth. Writes to the agent's
+/// private state directory (`state_dir/memory/`), never to the user-facing
+/// workspace, so pointing `workspace = "/home/me/Documents"` does not litter
+/// the user's folder with per-day markdown files. See issue #1097.
+fn append_daily_memory_log(state_dir: &Path, response: &str) {
     use std::io::Write;
     let trimmed = response.trim();
     if trimmed.is_empty() {
         return;
     }
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let log_path = workspace.join("memory").join(format!("{today}.md"));
+    let log_path = state_dir.join("memory").join(format!("{today}.md"));
     // Security: cap total daily log to 1MB
     if let Ok(metadata) = std::fs::metadata(&log_path) {
         if metadata.len() > 1_048_576 {
@@ -474,16 +497,18 @@ fn append_daily_memory_log(workspace: &Path, response: &str) {
     }
 }
 
-/// Read a workspace identity file with a size cap to prevent prompt stuffing.
-/// Returns None if the file doesn't exist or is empty.
-fn read_identity_file(workspace: &Path, filename: &str) -> Option<String> {
+/// Read an identity file from the agent's private state directory with a size
+/// cap to prevent prompt stuffing. Returns None if the file doesn't exist or
+/// is empty. Identity files live in `state_dir`, not in the user-facing
+/// workspace (see issue #1097), so this is called with the state directory.
+fn read_identity_file(state_dir: &Path, filename: &str) -> Option<String> {
     const MAX_IDENTITY_FILE_BYTES: usize = 32_768; // 32KB cap
-    let path = workspace.join(filename);
-    // Security: ensure path stays inside workspace
+    let path = state_dir.join(filename);
+    // Security: ensure path stays inside the state directory
     match path.canonicalize() {
         Ok(canonical) => {
-            if let Ok(ws_canonical) = workspace.canonicalize() {
-                if !canonical.starts_with(&ws_canonical) {
+            if let Ok(sd_canonical) = state_dir.canonicalize() {
+                if !canonical.starts_with(&sd_canonical) {
                     return None; // path traversal attempt
                 }
             }
@@ -800,6 +825,9 @@ impl OpenFangKernel {
         // Initialize model catalog, detect provider auth, and apply URL overrides
         let mut model_catalog = openfang_runtime::model_catalog::ModelCatalog::new();
         model_catalog.detect_auth();
+        // Env-var overrides for local providers (OLLAMA_HOST, LMSTUDIO_BASE_URL, etc.).
+        // Applied before `provider_urls` so explicit config.toml entries win. See #1154.
+        model_catalog.apply_local_env_overrides();
         if !config.provider_urls.is_empty() {
             model_catalog.apply_url_overrides(&config.provider_urls);
             info!(
@@ -1056,7 +1084,13 @@ impl OpenFangKernel {
         // Initialize media understanding engine
         let media_engine =
             openfang_runtime::media_understanding::MediaEngine::new(config.media.clone());
-        let tts_engine = openfang_runtime::tts::TtsEngine::new(config.tts.clone());
+        // Closes #1051: thread MediaConfig URL overrides into the TTS engine
+        // so local OpenAI/ElevenLabs-compatible services can be targeted.
+        let tts_engine = openfang_runtime::tts::TtsEngine::new(config.tts.clone())
+            .with_base_urls(
+                config.media.tts_openai_base_url.clone(),
+                config.media.tts_elevenlabs_base_url.clone(),
+            );
         let mut pairing = crate::pairing::PairingManager::new(config.pairing.clone());
 
         // Load paired devices from database and set up persistence callback
@@ -1188,6 +1222,41 @@ impl OpenFangKernel {
             agent_msg_locks: dashmap::DashMap::new(),
             self_handle: OnceLock::new(),
         };
+
+        // Wire HAND.toml load events into the Merkle audit chain so reload
+        // events (and future installs) leave a tamper-evident record of
+        // which manifest hash was active at any point in time. Issue #1172.
+        //
+        // The bundled + workspace hands were loaded before the kernel struct
+        // existed, so we backfill those hashes now and install a callback
+        // for every subsequent install/upsert/reload.
+        {
+            let audit_log_initial = Arc::clone(&kernel.audit_log);
+            for (hand_id, toml_content, _skill) in openfang_hands::bundled::bundled_hands() {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(toml_content.as_bytes());
+                let hash = hex::encode(hasher.finalize());
+                audit_log_initial.record(
+                    "kernel",
+                    openfang_runtime::audit::AuditAction::ConfigChange,
+                    format!("HAND.toml load hand={hand_id} sha256={hash}"),
+                    "ok",
+                );
+            }
+
+            let audit_log_for_cb = Arc::clone(&kernel.audit_log);
+            kernel.hand_registry.set_audit_callback(Arc::new(
+                move |hand_id: &str, hash: &str| {
+                    audit_log_for_cb.record(
+                        "kernel",
+                        openfang_runtime::audit::AuditAction::ConfigChange,
+                        format!("HAND.toml reload hand={hand_id} sha256={hash}"),
+                        "ok",
+                    );
+                },
+            ));
+        }
 
         // Restore persisted agents from SQLite
         match kernel.memory.load_all_agents() {
@@ -1598,15 +1667,24 @@ impl OpenFangKernel {
         // Apply global budget defaults to agent resource quotas
         apply_budget_defaults(&self.config.budget, &mut manifest.resources);
 
-        // Create workspace directory for the agent (name-based, so SOUL.md survives recreation)
-        let workspace_dir = manifest
-            .workspace
+        // Agent private state always lives under ~/.openfang/workspaces/{name}/.
+        // This is name-based so SOUL.md and per-agent memory survive recreation
+        // and never get dumped into a user-supplied workspace path. See #1097.
+        let state_dir = manifest
+            .state_dir
             .clone()
             .unwrap_or_else(|| self.config.effective_workspaces_dir().join(&name));
+        // The user-facing workspace defaults to the state_dir when the manifest
+        // does not specify one. When the user sets `workspace = "/path"` in
+        // agent.toml we leave that path alone — only data/, output/, skills/
+        // get created lazily so private state never pollutes the target dir.
+        let workspace_dir = manifest.workspace.clone().unwrap_or_else(|| state_dir.clone());
+        ensure_state_dir(&state_dir, &workspace_dir)?;
         ensure_workspace(&workspace_dir)?;
         if manifest.generate_identity_files {
-            generate_identity_files(&workspace_dir, &manifest);
+            generate_identity_files(&state_dir, &manifest);
         }
+        manifest.state_dir = Some(state_dir);
         manifest.workspace = Some(workspace_dir);
 
         // Register capabilities
@@ -2016,16 +2094,27 @@ impl OpenFangKernel {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
         let mut manifest = entry.manifest.clone();
 
-        // Lazy backfill: create workspace for existing agents spawned before workspaces
-        if manifest.workspace.is_none() {
-            let workspace_dir = self.config.effective_workspaces_dir().join(&manifest.name);
+        // Lazy backfill: create state_dir and workspace for existing agents
+        // spawned before this field existed. Private state always lives under
+        // ~/.openfang/workspaces/{name}/; the user-facing workspace defaults
+        // to the same path unless the manifest already pinned one. See #1097.
+        if manifest.state_dir.is_none() {
+            let state_dir = self.config.effective_workspaces_dir().join(&manifest.name);
+            let workspace_dir = manifest.workspace.clone().unwrap_or_else(|| state_dir.clone());
+            if let Err(e) = ensure_state_dir(&state_dir, &workspace_dir) {
+                warn!(agent_id = %agent_id, "Failed to backfill state_dir (streaming): {e}");
+            }
             if let Err(e) = ensure_workspace(&workspace_dir) {
                 warn!(agent_id = %agent_id, "Failed to backfill workspace (streaming): {e}");
             } else {
+                manifest.state_dir = Some(state_dir);
                 manifest.workspace = Some(workspace_dir);
                 let _ = self
                     .registry
                     .update_workspace(agent_id, manifest.workspace.clone());
+                let _ = self
+                    .registry
+                    .update_state_dir(agent_id, manifest.state_dir.clone());
             }
         }
 
@@ -2096,17 +2185,17 @@ impl OpenFangKernel {
                 },
                 workspace_path: manifest.workspace.as_ref().map(|p| p.display().to_string()),
                 soul_md: manifest
-                    .workspace
+                    .state_dir
                     .as_ref()
-                    .and_then(|w| read_identity_file(w, "SOUL.md")),
+                    .and_then(|s| read_identity_file(s, "SOUL.md")),
                 user_md: manifest
-                    .workspace
+                    .state_dir
                     .as_ref()
-                    .and_then(|w| read_identity_file(w, "USER.md")),
+                    .and_then(|s| read_identity_file(s, "USER.md")),
                 memory_md: manifest
-                    .workspace
+                    .state_dir
                     .as_ref()
-                    .and_then(|w| read_identity_file(w, "MEMORY.md")),
+                    .and_then(|s| read_identity_file(s, "MEMORY.md")),
                 canonical_context: self
                     .memory
                     .canonical_context(agent_id, None)
@@ -2121,27 +2210,27 @@ impl OpenFangKernel {
                     .unwrap_or(false),
                 is_autonomous: manifest.autonomous.is_some(),
                 agents_md: manifest
-                    .workspace
+                    .state_dir
                     .as_ref()
-                    .and_then(|w| read_identity_file(w, "AGENTS.md")),
+                    .and_then(|s| read_identity_file(s, "AGENTS.md")),
                 bootstrap_md: manifest
-                    .workspace
+                    .state_dir
                     .as_ref()
-                    .and_then(|w| read_identity_file(w, "BOOTSTRAP.md")),
+                    .and_then(|s| read_identity_file(s, "BOOTSTRAP.md")),
                 workspace_context: manifest.workspace.as_ref().map(|w| {
                     let mut ws_ctx =
                         openfang_runtime::workspace_context::WorkspaceContext::detect(w);
                     ws_ctx.build_context_section()
                 }),
                 identity_md: manifest
-                    .workspace
+                    .state_dir
                     .as_ref()
-                    .and_then(|w| read_identity_file(w, "IDENTITY.md")),
+                    .and_then(|s| read_identity_file(s, "IDENTITY.md")),
                 heartbeat_md: if manifest.autonomous.is_some() {
                     manifest
-                        .workspace
+                        .state_dir
                         .as_ref()
-                        .and_then(|w| read_identity_file(w, "HEARTBEAT.md"))
+                        .and_then(|s| read_identity_file(s, "HEARTBEAT.md"))
                 } else {
                     None
                 },
@@ -2282,15 +2371,17 @@ impl OpenFangKernel {
                         }
                     }
 
-                    // Write JSONL session mirror to workspace
-                    if let Some(ref workspace) = manifest.workspace {
+                    // Write JSONL session mirror and daily memory log to the
+                    // agent's private state directory, not the user-facing
+                    // workspace. See issue #1097.
+                    if let Some(ref state_dir) = manifest.state_dir {
                         if let Err(e) =
-                            memory.write_jsonl_mirror(&session, &workspace.join("sessions"))
+                            memory.write_jsonl_mirror(&session, &state_dir.join("sessions"))
                         {
                             warn!("Failed to write JSONL session mirror (streaming): {e}");
                         }
                         // Append daily memory log (best-effort)
-                        append_daily_memory_log(workspace, &result.response);
+                        append_daily_memory_log(state_dir, &result.response);
                     }
 
                     kernel_clone
@@ -2575,17 +2666,27 @@ impl OpenFangKernel {
         // Apply model routing if configured (disabled in Stable mode)
         let mut manifest = entry.manifest.clone();
 
-        // Lazy backfill: create workspace for existing agents spawned before workspaces
-        if manifest.workspace.is_none() {
-            let workspace_dir = self.config.effective_workspaces_dir().join(&manifest.name);
+        // Lazy backfill: create state_dir and workspace for existing agents.
+        // Private state lives under ~/.openfang/workspaces/{name}/. User-facing
+        // workspace stays at whatever the manifest pinned (or defaults to the
+        // state_dir). See issue #1097.
+        if manifest.state_dir.is_none() {
+            let state_dir = self.config.effective_workspaces_dir().join(&manifest.name);
+            let workspace_dir = manifest.workspace.clone().unwrap_or_else(|| state_dir.clone());
+            if let Err(e) = ensure_state_dir(&state_dir, &workspace_dir) {
+                warn!(agent_id = %agent_id, "Failed to backfill state_dir: {e}");
+            }
             if let Err(e) = ensure_workspace(&workspace_dir) {
                 warn!(agent_id = %agent_id, "Failed to backfill workspace: {e}");
             } else {
+                manifest.state_dir = Some(state_dir);
                 manifest.workspace = Some(workspace_dir);
-                // Persist updated workspace in registry
                 let _ = self
                     .registry
                     .update_workspace(agent_id, manifest.workspace.clone());
+                let _ = self
+                    .registry
+                    .update_state_dir(agent_id, manifest.state_dir.clone());
             }
         }
 
@@ -2664,17 +2765,17 @@ impl OpenFangKernel {
                 },
                 workspace_path: manifest.workspace.as_ref().map(|p| p.display().to_string()),
                 soul_md: manifest
-                    .workspace
+                    .state_dir
                     .as_ref()
-                    .and_then(|w| read_identity_file(w, "SOUL.md")),
+                    .and_then(|s| read_identity_file(s, "SOUL.md")),
                 user_md: manifest
-                    .workspace
+                    .state_dir
                     .as_ref()
-                    .and_then(|w| read_identity_file(w, "USER.md")),
+                    .and_then(|s| read_identity_file(s, "USER.md")),
                 memory_md: manifest
-                    .workspace
+                    .state_dir
                     .as_ref()
-                    .and_then(|w| read_identity_file(w, "MEMORY.md")),
+                    .and_then(|s| read_identity_file(s, "MEMORY.md")),
                 canonical_context: self
                     .memory
                     .canonical_context(agent_id, None)
@@ -2689,27 +2790,27 @@ impl OpenFangKernel {
                     .unwrap_or(false),
                 is_autonomous: manifest.autonomous.is_some(),
                 agents_md: manifest
-                    .workspace
+                    .state_dir
                     .as_ref()
-                    .and_then(|w| read_identity_file(w, "AGENTS.md")),
+                    .and_then(|s| read_identity_file(s, "AGENTS.md")),
                 bootstrap_md: manifest
-                    .workspace
+                    .state_dir
                     .as_ref()
-                    .and_then(|w| read_identity_file(w, "BOOTSTRAP.md")),
+                    .and_then(|s| read_identity_file(s, "BOOTSTRAP.md")),
                 workspace_context: manifest.workspace.as_ref().map(|w| {
                     let mut ws_ctx =
                         openfang_runtime::workspace_context::WorkspaceContext::detect(w);
                     ws_ctx.build_context_section()
                 }),
                 identity_md: manifest
-                    .workspace
+                    .state_dir
                     .as_ref()
-                    .and_then(|w| read_identity_file(w, "IDENTITY.md")),
+                    .and_then(|s| read_identity_file(s, "IDENTITY.md")),
                 heartbeat_md: if manifest.autonomous.is_some() {
                     manifest
-                        .workspace
+                        .state_dir
                         .as_ref()
-                        .and_then(|w| read_identity_file(w, "HEARTBEAT.md"))
+                        .and_then(|s| read_identity_file(s, "HEARTBEAT.md"))
                 } else {
                     None
                 },
@@ -2847,16 +2948,17 @@ impl OpenFangKernel {
             }
         }
 
-        // Write JSONL session mirror to workspace
-        if let Some(ref workspace) = manifest.workspace {
+        // Write JSONL session mirror and daily memory log to the agent's
+        // private state directory, not the user-facing workspace. See #1097.
+        if let Some(ref state_dir) = manifest.state_dir {
             if let Err(e) = self
                 .memory
-                .write_jsonl_mirror(&session, &workspace.join("sessions"))
+                .write_jsonl_mirror(&session, &state_dir.join("sessions"))
             {
                 warn!("Failed to write JSONL session mirror: {e}");
             }
             // Append daily memory log (best-effort)
-            append_daily_memory_log(workspace, &result.response);
+            append_daily_memory_log(state_dir, &result.response);
         }
 
         // Record usage in the metering engine (uses catalog pricing as single source of truth)
@@ -5184,26 +5286,93 @@ impl OpenFangKernel {
     }
 
     /// Collect every provider ID the operator has actually referenced in
-    /// their effective config — the default model, every fallback chain
-    /// entry, every `[provider_urls]` key, and every registered agent's
-    /// manifest provider (including per-agent `fallback_models`). Used by
-    /// the local provider probe loop so that we don't spam `WARN Local
-    /// provider offline` for providers the user never asked about (#1031).
+    /// their effective config. Walks the surfaces below so the local
+    /// provider probe loop does not spam `WARN Local provider offline`
+    /// for providers the user never asked about (#1031, #1188):
+    ///
+    /// 1. Default model (boot config + hot-reload override).
+    /// 2. Global fallback chain (boot config + hot-reload override).
+    /// 3. Explicit `[provider_urls]` keys.
+    /// 4. Every registered agent manifest provider + per-agent
+    ///    `fallback_models`.
+    /// 5. Catalog-resolved aliases — model names on default/fallback/manifest
+    ///    that resolve to a different concrete provider via the catalog.
+    /// 6. Per-channel `overrides.model` for every enabled channel adapter,
+    ///    resolved through the model catalog.
+    /// 7. Bundled and user-installed skills — tags that match a known
+    ///    provider ID, and `config` variables whose `env` matches a known
+    ///    provider's `api_key_env`.
+    /// 8. MCP server configs — `env` entries that match a known provider's
+    ///    `api_key_env`.
     fn referenced_providers(&self) -> std::collections::HashSet<String> {
         let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Snapshot catalog lookups up front so we don't keep the lock across
+        // long iterations. Provider IDs are lowercased model-side already.
+        let (provider_ids, env_to_provider) = {
+            let catalog = self
+                .model_catalog
+                .read()
+                .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
+            let ids: std::collections::HashSet<String> = catalog
+                .list_providers()
+                .iter()
+                .map(|p| p.id.clone())
+                .collect();
+            // Multi-valued: several providers may share the same api_key_env
+            // (e.g. both `openai` and `codex` use OPENAI_API_KEY). Using a
+            // plain HashMap silently dropped earlier providers — broke #1188.
+            let mut env_map: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for p in catalog.list_providers() {
+                if p.api_key_env.is_empty() {
+                    continue;
+                }
+                env_map
+                    .entry(p.api_key_env.to_ascii_uppercase())
+                    .or_default()
+                    .push(p.id.clone());
+            }
+            (ids, env_map)
+        };
+
+        // Resolve a model name through the catalog and add the concrete
+        // provider it lives on. Lets us catch alias-only references where
+        // the surrounding `provider` field is "default" or empty (#1188).
+        let add_model = |set: &mut std::collections::HashSet<String>, name: &str| {
+            if name.is_empty() || name == "default" {
+                return;
+            }
+            let catalog = self
+                .model_catalog
+                .read()
+                .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
+            if let Some(entry) = catalog.find_model(name) {
+                let p = &entry.provider;
+                if !p.is_empty() && p != "default" {
+                    set.insert(p.clone());
+                }
+            }
+        };
 
         // Default model — respect hot-reloaded override.
         let override_guard = self
             .default_model_override
             .read()
             .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
-        let dm_provider = override_guard
+        let (dm_provider, dm_model) = override_guard
             .as_ref()
-            .map(|dm| dm.provider.clone())
-            .unwrap_or_else(|| self.config.default_model.provider.clone());
+            .map(|dm| (dm.provider.clone(), dm.model.clone()))
+            .unwrap_or_else(|| {
+                (
+                    self.config.default_model.provider.clone(),
+                    self.config.default_model.model.clone(),
+                )
+            });
         if !dm_provider.is_empty() && dm_provider != "default" {
             set.insert(dm_provider);
         }
+        add_model(&mut set, &dm_model);
         drop(override_guard);
 
         // Global fallback chain — respect hot-reloaded override.
@@ -5218,6 +5387,7 @@ impl OpenFangKernel {
             if !fb.provider.is_empty() && fb.provider != "default" {
                 set.insert(fb.provider.clone());
             }
+            add_model(&mut set, &fb.model);
         }
         drop(fb_override);
 
@@ -5232,9 +5402,112 @@ impl OpenFangKernel {
             if !p.is_empty() && p != "default" {
                 set.insert(p.clone());
             }
+            add_model(&mut set, &entry.manifest.model.model);
             for fb in &entry.manifest.fallback_models {
                 if !fb.provider.is_empty() && fb.provider != "default" {
                     set.insert(fb.provider.clone());
+                }
+                add_model(&mut set, &fb.model);
+            }
+        }
+
+        // Channel adapters — each enabled channel may pin `overrides.model`
+        // to a specific model, which resolves to a concrete provider through
+        // the catalog. Skip when no override is set.
+        let ch = &self.config.channels;
+        let channel_overrides: [Option<&openfang_types::config::ChannelOverrides>; 43] = [
+            ch.telegram.as_ref().map(|c| &c.overrides),
+            ch.discord.as_ref().map(|c| &c.overrides),
+            ch.slack.as_ref().map(|c| &c.overrides),
+            ch.whatsapp.as_ref().map(|c| &c.overrides),
+            ch.signal.as_ref().map(|c| &c.overrides),
+            ch.matrix.as_ref().map(|c| &c.overrides),
+            ch.email.as_ref().map(|c| &c.overrides),
+            ch.teams.as_ref().map(|c| &c.overrides),
+            ch.mattermost.as_ref().map(|c| &c.overrides),
+            ch.irc.as_ref().map(|c| &c.overrides),
+            ch.google_chat.as_ref().map(|c| &c.overrides),
+            ch.twitch.as_ref().map(|c| &c.overrides),
+            ch.rocketchat.as_ref().map(|c| &c.overrides),
+            ch.zulip.as_ref().map(|c| &c.overrides),
+            ch.xmpp.as_ref().map(|c| &c.overrides),
+            ch.line.as_ref().map(|c| &c.overrides),
+            ch.viber.as_ref().map(|c| &c.overrides),
+            ch.messenger.as_ref().map(|c| &c.overrides),
+            ch.reddit.as_ref().map(|c| &c.overrides),
+            ch.mastodon.as_ref().map(|c| &c.overrides),
+            ch.bluesky.as_ref().map(|c| &c.overrides),
+            ch.feishu.as_ref().map(|c| &c.overrides),
+            ch.revolt.as_ref().map(|c| &c.overrides),
+            ch.nextcloud.as_ref().map(|c| &c.overrides),
+            ch.guilded.as_ref().map(|c| &c.overrides),
+            ch.keybase.as_ref().map(|c| &c.overrides),
+            ch.threema.as_ref().map(|c| &c.overrides),
+            ch.nostr.as_ref().map(|c| &c.overrides),
+            ch.webex.as_ref().map(|c| &c.overrides),
+            ch.pumble.as_ref().map(|c| &c.overrides),
+            ch.flock.as_ref().map(|c| &c.overrides),
+            ch.twist.as_ref().map(|c| &c.overrides),
+            ch.mumble.as_ref().map(|c| &c.overrides),
+            ch.dingtalk.as_ref().map(|c| &c.overrides),
+            ch.dingtalk_stream.as_ref().map(|c| &c.overrides),
+            ch.discourse.as_ref().map(|c| &c.overrides),
+            ch.gitter.as_ref().map(|c| &c.overrides),
+            ch.ntfy.as_ref().map(|c| &c.overrides),
+            ch.gotify.as_ref().map(|c| &c.overrides),
+            ch.webhook.as_ref().map(|c| &c.overrides),
+            ch.linkedin.as_ref().map(|c| &c.overrides),
+            ch.wecom.as_ref().map(|c| &c.overrides),
+            ch.mqtt.as_ref().map(|c| &c.overrides),
+        ];
+        for overrides in channel_overrides.iter().flatten() {
+            if let Some(model) = overrides.model.as_deref() {
+                add_model(&mut set, model);
+            }
+        }
+
+        // Skills — bundled + user-installed. Two indirect provider hints:
+        //   1. Tag matching a known provider ID (e.g. tag "openai" on a
+        //      skill that drives the OpenAI API).
+        //   2. A declared config variable whose `env` matches a known
+        //      provider's `api_key_env` (e.g. env = "OPENAI_API_KEY"
+        //      → openai).
+        let skill_registry = self
+            .skill_registry
+            .read()
+            .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
+        for skill in skill_registry.list() {
+            for tag in &skill.manifest.skill.tags {
+                let lower = tag.to_ascii_lowercase();
+                if provider_ids.contains(&lower) {
+                    set.insert(lower);
+                }
+            }
+            for var in skill.manifest.config.values() {
+                if let Some(env_name) = var.env.as_deref() {
+                    if let Some(providers) =
+                        env_to_provider.get(&env_name.to_ascii_uppercase())
+                    {
+                        for provider in providers {
+                            set.insert(provider.clone());
+                        }
+                    }
+                }
+            }
+        }
+        drop(skill_registry);
+
+        // MCP server configs — each entry's `env` allowlist may include a
+        // provider's API key env var, which is enough evidence the operator
+        // wired that provider into their MCP server.
+        for server in &self.config.mcp_servers {
+            for env_name in &server.env {
+                if let Some(providers) =
+                    env_to_provider.get(&env_name.to_ascii_uppercase())
+                {
+                    for provider in providers {
+                        set.insert(provider.clone());
+                    }
                 }
             }
         }
@@ -6123,7 +6396,16 @@ impl OpenFangKernel {
                 summary.push_str(&format!("- {name}: {desc} [tools: {}]\n", tools.join(", ")));
             }
         }
-        summary.push_str("Use these skill tools when they match the user's request.");
+        // Issue #1038: skill directories (e.g. ~/.openfang/skills/) live OUTSIDE
+        // the workspace sandbox. Tell the agent to use the dedicated skill_*
+        // tools instead of falling back to file_read / shell_exec to inspect them.
+        summary.push_str(
+            "Use these skill tools when they match the user's request. \
+             To inspect a skill's full instructions, call skill_describe with the skill name — \
+             do NOT use file_read or shell_exec on the skills directory, those paths are \
+             outside the agent workspace and will fail. \
+             Use skill_list to enumerate skills and skill_execute to run a skill's tool.",
+        );
         summary
     }
 
@@ -7653,6 +7935,7 @@ mod tests {
             autonomous: None,
             pinned_model: None,
             workspace: None,
+            state_dir: None,
             generate_identity_files: true,
             exec_policy: None,
             tool_allowlist: vec![],
@@ -7696,6 +7979,7 @@ mod tests {
             autonomous: None,
             pinned_model: None,
             workspace: Some(std::path::PathBuf::from("/var/lib/openfang/agents/demo")),
+            state_dir: None,
             generate_identity_files: true,
             exec_policy: Some(ExecPolicy::default()),
             tool_allowlist: vec![],
@@ -7747,6 +8031,7 @@ mod tests {
             autonomous: None,
             pinned_model: None,
             workspace: Some(std::path::PathBuf::from("/old")),
+            state_dir: None,
             generate_identity_files: true,
             exec_policy: None,
             tool_allowlist: vec![],
@@ -7803,6 +8088,7 @@ mod tests {
             autonomous: None,
             pinned_model: None,
             workspace: None,
+            state_dir: None,
             generate_identity_files: true,
             exec_policy: Some(cached_policy.clone()),
             tool_allowlist: vec![],
@@ -7916,6 +8202,7 @@ mod tests {
             autonomous: None,
             pinned_model: None,
             workspace: None,
+            state_dir: None,
             generate_identity_files: true,
             exec_policy: None,
             tool_allowlist: vec![],
@@ -8063,6 +8350,69 @@ mod tests {
         assert!(!caps
             .iter()
             .any(|c| matches!(c, Capability::ToolInvoke(name) if name == "shell_exec")));
+    }
+
+    // ----------------------------------------------------------------------
+    // Issue #1164: Agent Stop on a hand-owned agent must also deactivate the
+    // hand instance, otherwise the hand stays Active and the user cannot
+    // re-activate it (wizard fails with 400 "Hand already active").
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_hand_owned_agent_stop_clears_hand_for_reactivation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-kernel-hand-stop-test");
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
+
+        // Activate a hand and grab its agent id (mirrors what the wizard does).
+        let instance = kernel
+            .activate_hand("lead", HashMap::new(), None)
+            .expect("lead hand should activate");
+        let agent_id = instance.agent_id.expect("lead hand agent id");
+        let first_instance_id = instance.instance_id;
+
+        // Sanity: hand is Active and re-activation is rejected.
+        assert!(kernel
+            .activate_hand("lead", HashMap::new(), None)
+            .is_err());
+
+        // Simulate what POST /api/agents/{id}/stop now does for a hand-owned
+        // agent: look up the instance and deactivate the hand (which also
+        // kills the agent and cancels any running task).
+        let owning = kernel
+            .hand_registry
+            .find_by_agent(agent_id)
+            .expect("active hand owning the agent");
+        assert_eq!(owning.instance_id, first_instance_id);
+        kernel
+            .deactivate_hand(owning.instance_id)
+            .expect("deactivate via stop path");
+
+        // The hand instance must be gone now — re-activation must succeed.
+        assert!(kernel.hand_registry.find_by_agent(agent_id).is_none());
+        let active: Vec<_> = kernel
+            .hand_registry
+            .list_instances()
+            .into_iter()
+            .filter(|i| i.hand_id == "lead")
+            .collect();
+        assert!(
+            active.is_empty(),
+            "no lead instances should remain after stop",
+        );
+
+        let second = kernel
+            .activate_hand("lead", HashMap::new(), None)
+            .expect("hand must be re-activatable after stop");
+        assert_ne!(second.instance_id, first_instance_id);
+
+        kernel.shutdown();
     }
 
     // ----------------------------------------------------------------------
@@ -8663,6 +9013,187 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
+    // Issue #1188: referenced_providers() must also walk MCP server configs,
+    // skill manifests, channel adapters, and catalog aliases. Otherwise the
+    // probe loop still spams "Local provider offline" for providers that are
+    // referenced indirectly. Each block below pins one new surface so a
+    // regression on any single surface fails its own assertion.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn test_1188_referenced_providers_resolves_alias_to_provider() {
+        use openfang_types::config::DefaultModelConfig;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-1188-alias");
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        // Operator sets provider = "default" and picks the model by its
+        // builtin catalog alias "opus", which resolves to provider
+        // "anthropic". The literal provider field is "default", so the
+        // pre-fix walker would not have added anthropic.
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            default_model: DefaultModelConfig {
+                provider: "default".to_string(),
+                model: "opus".to_string(),
+                api_key_env: "ANTHROPIC_API_KEY".to_string(),
+                base_url: None,
+                subprocess_timeout_secs: None,
+            },
+            ..KernelConfig::default()
+        };
+
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
+        let referenced = kernel.referenced_providers();
+        assert!(
+            referenced.contains("anthropic"),
+            "alias 'opus' must resolve to anthropic ({referenced:?})"
+        );
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn test_1188_referenced_providers_walks_channel_overrides() {
+        use openfang_types::config::{
+            ChannelOverrides, ChannelsConfig, DefaultModelConfig, TelegramConfig,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-1188-channel");
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        let overrides = ChannelOverrides {
+            model: Some("opus".to_string()),
+            ..ChannelOverrides::default()
+        };
+
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            default_model: DefaultModelConfig {
+                provider: "groq".to_string(),
+                model: "llama-3.1-70b".to_string(),
+                api_key_env: "GROQ_API_KEY".to_string(),
+                base_url: None,
+                subprocess_timeout_secs: None,
+            },
+            channels: ChannelsConfig {
+                telegram: Some(TelegramConfig {
+                    overrides,
+                    ..TelegramConfig::default()
+                }),
+                ..ChannelsConfig::default()
+            },
+            ..KernelConfig::default()
+        };
+
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
+        let referenced = kernel.referenced_providers();
+        assert!(
+            referenced.contains("anthropic"),
+            "channel override 'opus' must pull in anthropic ({referenced:?})"
+        );
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn test_1188_referenced_providers_walks_mcp_env() {
+        use openfang_types::config::{
+            DefaultModelConfig, McpServerConfigEntry, McpTransportEntry,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-1188-mcp");
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        // MCP server passes through OPENAI_API_KEY, which is the api_key_env
+        // for the openai provider, so openai must be considered referenced.
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            default_model: DefaultModelConfig {
+                provider: "groq".to_string(),
+                model: "llama-3.1-70b".to_string(),
+                api_key_env: "GROQ_API_KEY".to_string(),
+                base_url: None,
+                subprocess_timeout_secs: None,
+            },
+            mcp_servers: vec![McpServerConfigEntry {
+                name: "openai-proxy".to_string(),
+                transport: McpTransportEntry::Stdio {
+                    command: "node".to_string(),
+                    args: vec!["proxy.js".to_string()],
+                },
+                timeout_secs: 30,
+                env: vec!["OPENAI_API_KEY".to_string()],
+                headers: vec![],
+            }],
+            ..KernelConfig::default()
+        };
+
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
+        let referenced = kernel.referenced_providers();
+        assert!(
+            referenced.contains("openai"),
+            "MCP env OPENAI_API_KEY must pull in openai ({referenced:?})"
+        );
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn test_1188_referenced_providers_walks_skill_tags() {
+        use openfang_types::config::DefaultModelConfig;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-1188-skill");
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            default_model: DefaultModelConfig {
+                provider: "groq".to_string(),
+                model: "llama-3.1-70b".to_string(),
+                api_key_env: "GROQ_API_KEY".to_string(),
+                base_url: None,
+                subprocess_timeout_secs: None,
+            },
+            ..KernelConfig::default()
+        };
+
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
+
+        // Drop a minimal skill manifest with a tag matching a known
+        // provider ID, then load it through the kernel's registry.
+        let skill_dir = home_dir.join("skills").join("openai-helper");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let manifest_toml = r#"
+[skill]
+name = "openai-helper"
+version = "0.1.0"
+description = "test skill"
+tags = ["openai"]
+
+[runtime]
+type = "promptonly"
+"#;
+        std::fs::write(skill_dir.join("skill.toml"), manifest_toml).unwrap();
+        {
+            let mut reg = kernel.skill_registry.write().unwrap();
+            reg.load_skill(&skill_dir).expect("skill loads");
+        }
+
+        let referenced = kernel.referenced_providers();
+        assert!(
+            referenced.contains("openai"),
+            "skill tag 'openai' must pull in openai ({referenced:?})"
+        );
+        kernel.shutdown();
+    }
+
+    // ----------------------------------------------------------------------
     // Issue #1140: agents placed at ~/.openfang/agents/<name>/agent.toml
     // must auto-spawn on boot so they appear in the chat tab.
     // ----------------------------------------------------------------------
@@ -8748,5 +9279,79 @@ system_prompt = "You are a test agent."
         assert!(kernel2.registry.find_by_name("my-custom-agent").is_some());
 
         kernel2.shutdown();
+    }
+
+    /// Regression for #1097: when a user points an agent's workspace at an
+    /// existing directory like `~/Documents`, the runtime must NOT scaffold
+    /// private state into that directory. Identity files (SOUL.md, AGENT.json,
+    /// etc.) and `sessions/` / `memory/` / `logs/` must land in the agent's
+    /// private state directory; only the lightweight user-facing layout
+    /// (`data/`, `output/`, `skills/`) may appear in the workspace.
+    #[test]
+    fn test_workspace_outside_openfang_stays_clean() {
+        use tempfile::TempDir;
+
+        let user_workspace = TempDir::new().expect("temp user workspace");
+        let state_dir = TempDir::new().expect("temp state dir");
+
+        // Pre-populate the user workspace with an unrelated file to make sure
+        // we don't trample existing contents either.
+        std::fs::write(user_workspace.path().join("pre-existing.txt"), b"hello")
+            .expect("write pre-existing file");
+
+        let manifest = AgentManifest {
+            name: "ws-test".to_string(),
+            description: "x".to_string(),
+            ..AgentManifest::default()
+        };
+
+        // Simulate the spawn path: state dir gets the private layout, user
+        // workspace only gets the lightweight subdirs.
+        ensure_state_dir(state_dir.path(), user_workspace.path()).expect("ensure_state_dir");
+        ensure_workspace(user_workspace.path()).expect("ensure_workspace");
+        generate_identity_files(state_dir.path(), &manifest);
+
+        // Private state files must live in state_dir.
+        for fname in &[
+            "AGENT.json",
+            "SOUL.md",
+            "USER.md",
+            "MEMORY.md",
+            "AGENTS.md",
+            "BOOTSTRAP.md",
+            "IDENTITY.md",
+        ] {
+            assert!(
+                state_dir.path().join(fname).exists(),
+                "{fname} should be created in state_dir"
+            );
+            assert!(
+                !user_workspace.path().join(fname).exists(),
+                "{fname} must NOT pollute the user-facing workspace (issue #1097)"
+            );
+        }
+        for subdir in &["sessions", "memory", "logs"] {
+            assert!(
+                state_dir.path().join(subdir).is_dir(),
+                "{subdir}/ should be created in state_dir"
+            );
+            assert!(
+                !user_workspace.path().join(subdir).exists(),
+                "{subdir}/ must NOT pollute the user-facing workspace (issue #1097)"
+            );
+        }
+
+        // The user-facing workspace gets only the lightweight layout.
+        for subdir in &["data", "output", "skills"] {
+            assert!(
+                user_workspace.path().join(subdir).is_dir(),
+                "{subdir}/ should be created in workspace"
+            );
+        }
+
+        // The pre-existing file must still be intact.
+        let contents = std::fs::read_to_string(user_workspace.path().join("pre-existing.txt"))
+            .expect("read pre-existing");
+        assert_eq!(contents, "hello", "must not overwrite user files");
     }
 }

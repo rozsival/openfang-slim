@@ -187,6 +187,10 @@ pub async fn build_router(
                 .patch(routes::patch_agent),
         )
         .route(
+            "/api/agents/{id}/uninstall",
+            axum::routing::delete(routes::uninstall_agent),
+        )
+        .route(
             "/api/agents/{id}/mode",
             axum::routing::put(routes::set_agent_mode),
         )
@@ -389,6 +393,11 @@ pub async fn build_router(
         .route(
             "/api/skills/reload",
             axum::routing::post(routes::reload_skills),
+        )
+        // Audit trail (issue #1174 — instance-side wrapper integration)
+        .route(
+            "/api/audit/append",
+            axum::routing::post(routes::audit_append),
         )
         .route(
             "/api/skills/{id}/config",
