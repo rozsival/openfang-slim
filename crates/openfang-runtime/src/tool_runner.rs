@@ -205,6 +205,7 @@ pub async fn execute_tool(
         "file_read" => tool_file_read(input, workspace_root).await,
         "file_write" => tool_file_write(input, workspace_root).await,
         "file_list" => tool_file_list(input, workspace_root).await,
+        "create_directory" => tool_create_directory(input, workspace_root).await,
         "apply_patch" => tool_apply_patch(input, workspace_root).await,
 
         // Web tools (upgraded: multi-provider search, SSRF-protected fetch)
@@ -299,6 +300,7 @@ pub async fn execute_tool(
         "agent_spawn" => tool_agent_spawn(input, kernel, caller_agent_id).await,
         "agent_list" => tool_agent_list(kernel),
         "agent_kill" => tool_agent_kill(input, kernel),
+        "agent_activate" => tool_agent_activate(input, kernel),
 
         // Shared memory tools
         "memory_store" => tool_memory_store(input, kernel),
@@ -595,6 +597,17 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "create_directory".to_string(),
+            description: "Create a directory (and any missing parent directories) at the given path. Paths are relative to the agent workspace. Idempotent: succeeds if the directory already exists.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "The directory path to create" }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolDefinition {
             name: "apply_patch".to_string(),
             description: "Apply a multi-hunk diff patch to add, update, move, or delete files. Use this for targeted edits instead of full file overwrites.".to_string(),
             input_schema: serde_json::json!({
@@ -690,6 +703,24 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "agent_id": { "type": "string", "description": "The agent's UUID to kill" }
+                },
+                "required": ["agent_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "agent_activate".to_string(),
+            description: "Activate (wake up) an inactive agent so it can receive messages \
+                          and process events. Use this when agent_list shows an agent in a \
+                          Suspended, Crashed, or Created state and you want to delegate work \
+                          to it via agent_send. Terminated agents cannot be revived."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": "The target agent's UUID or human-readable name"
+                    }
                 },
                 "required": ["agent_id"]
             }),
@@ -1339,6 +1370,80 @@ async fn tool_file_write(
     ))
 }
 
+/// Resolve a directory path for creation. Unlike `resolve_file_path`, this walks
+/// up the path to find the nearest existing ancestor, canonicalizes that, and
+/// re-appends the missing segments. This lets `create_directory` accept nested
+/// paths like `a/b/c/d` even when none of `a`, `b`, `c` exist yet.
+fn resolve_directory_path_for_create(
+    raw_path: &str,
+    workspace_root: Option<&Path>,
+) -> Result<PathBuf, String> {
+    // Reject `..` components regardless of workspace.
+    let _ = validate_path(raw_path)?;
+
+    let Some(root) = workspace_root else {
+        return Ok(PathBuf::from(raw_path));
+    };
+
+    let path = Path::new(raw_path);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+
+    let canon_root = root
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve workspace root: {e}"))?;
+
+    // Walk up to find the nearest existing ancestor, canonicalize it, then
+    // re-append the missing tail.
+    let mut existing: PathBuf = candidate.clone();
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    while !existing.exists() {
+        let Some(parent) = existing.parent() else {
+            return Err("Invalid path: no existing ancestor".to_string());
+        };
+        let Some(name) = existing.file_name() else {
+            return Err("Invalid path: no filename component".to_string());
+        };
+        tail.push(name);
+        existing = parent.to_path_buf();
+    }
+
+    let canon_existing = existing
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve ancestor directory: {e}"))?;
+
+    let mut resolved = canon_existing;
+    for segment in tail.into_iter().rev() {
+        resolved.push(segment);
+    }
+
+    if !resolved.starts_with(&canon_root) {
+        return Err(format!(
+            "Access denied: path '{raw_path}' resolves outside workspace"
+        ));
+    }
+
+    Ok(resolved)
+}
+
+async fn tool_create_directory(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+) -> Result<String, String> {
+    let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
+    if raw_path.is_empty() {
+        return Err("'path' parameter is empty".to_string());
+    }
+    let resolved = resolve_directory_path_for_create(raw_path, workspace_root)?;
+    tokio::fs::create_dir_all(&resolved)
+        .await
+        .map_err(|e| format!("Failed to create directory: {e}"))?;
+    Ok(format!("Created directory {}", resolved.display()))
+}
+
 async fn tool_file_list(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
@@ -1694,6 +1799,20 @@ fn tool_agent_kill(
         .ok_or("Missing 'agent_id' parameter")?;
     kh.kill_agent(agent_id)?;
     Ok(format!("Agent {agent_id} killed successfully."))
+}
+
+fn tool_agent_activate(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let agent_id = input["agent_id"]
+        .as_str()
+        .ok_or("Missing 'agent_id' parameter")?;
+    let name = kh.activate_agent(agent_id)?;
+    Ok(format!(
+        "Agent '{name}' activated. It is now Running and ready to receive messages."
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -3415,11 +3534,16 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         // Original 12
         assert!(names.contains(&"file_read"));
+        assert!(names.contains(&"file_write"));
+        assert!(names.contains(&"file_list"));
+        assert!(names.contains(&"create_directory"));
         assert!(names.contains(&"shell_exec"));
         assert!(names.contains(&"agent_send"));
         assert!(names.contains(&"agent_spawn"));
         assert!(names.contains(&"agent_list"));
         assert!(names.contains(&"agent_kill"));
+        // Issue #890 — wake up inactive agents
+        assert!(names.contains(&"agent_activate"));
         assert!(names.contains(&"memory_store"));
         assert!(names.contains(&"memory_recall"));
         // 6 collaboration tools
@@ -3582,6 +3706,102 @@ mod tests {
         .await;
         assert!(result.is_error);
         assert!(result.content.contains("traversal"));
+    }
+
+    #[tokio::test]
+    async fn test_create_directory_path_traversal_blocked() {
+        let result = execute_tool(
+            "test-id",
+            "create_directory",
+            &serde_json::json!({"path": "../../etc/evil"}),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // media_engine
+            None, // exec_policy
+            None, // tts_engine
+            None, // docker_config
+            None, // process_manager
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("traversal"));
+    }
+
+    #[tokio::test]
+    async fn test_create_directory_creates_nested() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let result = tool_create_directory(
+            &serde_json::json!({"path": "a/b/c"}),
+            Some(root),
+        )
+        .await;
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
+        let expected = root.join("a").join("b").join("c");
+        assert!(expected.is_dir(), "Expected directory to exist: {}", expected.display());
+    }
+
+    #[tokio::test]
+    async fn test_create_directory_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        // First create
+        let r1 = tool_create_directory(
+            &serde_json::json!({"path": "data/logs"}),
+            Some(root),
+        )
+        .await;
+        assert!(r1.is_ok());
+        // Second create on existing dir should also succeed
+        let r2 = tool_create_directory(
+            &serde_json::json!({"path": "data/logs"}),
+            Some(root),
+        )
+        .await;
+        assert!(r2.is_ok(), "Expected idempotent success, got: {:?}", r2);
+    }
+
+    #[tokio::test]
+    async fn test_create_directory_missing_path_param() {
+        let result = tool_create_directory(&serde_json::json!({}), None).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("Missing 'path'"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_create_directory_dispatch_via_execute_tool() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let result = execute_tool(
+            "test-id",
+            "create_directory",
+            &serde_json::json!({"path": "nested/folder"}),
+            None,            // kernel
+            None,            // allowed_tools
+            None,            // caller_agent_id
+            None,            // skill_registry
+            None,            // mcp_connections
+            None,            // web_ctx
+            None,            // browser_ctx
+            None,            // allowed_env_vars
+            Some(root.as_path()), // workspace_root
+            None,            // media_engine
+            None,            // exec_policy
+            None,            // tts_engine
+            None,            // docker_config
+            None,            // process_manager
+        )
+        .await;
+        assert!(!result.is_error, "Expected success, got: {}", result.content);
+        assert!(root.join("nested").join("folder").is_dir());
     }
 
     #[tokio::test]

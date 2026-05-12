@@ -498,7 +498,7 @@ impl TelegramAdapter {
                 self.api_send_photo(chat_id, &url, caption.as_deref(), thread_id)
                     .await?;
             }
-            ChannelContent::File { url, filename } => {
+            ChannelContent::File { url, filename, .. } => {
                 self.api_send_document(chat_id, &url, &filename, thread_id)
                     .await?;
             }
@@ -520,6 +520,17 @@ impl TelegramAdapter {
                 let text = format!("/{name} {}", args.join(" "));
                 self.api_send_message(chat_id, text.trim(), thread_id)
                     .await?;
+            }
+            ChannelContent::Multipart(parts) => {
+                // Send each child as its own Telegram message. Nested
+                // Multipart is rejected by adapters; flatten defensively.
+                for part in parts {
+                    if let ChannelContent::Multipart(_) = part {
+                        debug_assert!(false, "nested Multipart in send_to_user");
+                        continue;
+                    }
+                    Box::pin(self.send_content(user, part, thread_id)).await?;
+                }
             }
         }
         Ok(())
@@ -934,7 +945,12 @@ async fn parse_telegram_update(
             .unwrap_or("document")
             .to_string();
         match telegram_get_file_url(token, client, file_id, api_base_url).await {
-            Some(url) => ChannelContent::File { url, filename },
+            Some(url) => ChannelContent::File {
+                url,
+                filename,
+                mime: None,
+                size: None,
+            },
             None => ChannelContent::Text(format!("[Document received: {filename}]")),
         }
     } else if message.get("voice").is_some() {
@@ -998,6 +1014,16 @@ async fn parse_telegram_update(
 
     // Detect @mention of the bot in entities / caption_entities for MentionOnly group policy.
     let mut metadata = HashMap::new();
+
+    // Always expose the Telegram numeric user_id in metadata. Display names are not
+    // unique and can change, so agents that need stable per-user keys (RBAC, per-user
+    // workspaces, deterministic routing) must rely on this id. The id originates from
+    // `message.from.id` for normal users or `message.sender_chat.id` for messages sent
+    // on behalf of a channel/group. See issue #915.
+    metadata.insert(
+        "telegram_user_id".to_string(),
+        serde_json::json!(user_id_str),
+    );
 
     // Store reply_to_message_id in metadata for downstream consumers.
     if let Some(reply_msg) = message.get("reply_to_message") {
@@ -1177,6 +1203,83 @@ mod tests {
         assert_eq!(msg.sender.display_name, "Alice Smith");
         assert_eq!(msg.sender.platform_id, "111222333");
         assert!(matches!(msg.content, ChannelContent::Text(ref t) if t == "Hello, agent!"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_injects_telegram_user_id_metadata() {
+        // Issue #915 — agents need a stable per-user identifier. The numeric
+        // Telegram user_id from `message.from.id` must land in metadata as a
+        // string so downstream consumers (bridge prompt builder, tools, etc.)
+        // can key per-user state on it.
+        let update = serde_json::json!({
+            "update_id": 555,
+            "message": {
+                "message_id": 1,
+                "from": {
+                    "id": 554772934_i64,
+                    "first_name": "Alena"
+                },
+                "chat": {
+                    "id": -1009876543210_i64,
+                    "type": "group"
+                },
+                "date": 1700000000,
+                "text": "Hello"
+            }
+        });
+
+        let client = test_client();
+        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
+            .await
+            .unwrap();
+
+        // The chat_id (used for replies) stays on sender.platform_id.
+        assert_eq!(msg.sender.platform_id, "-1009876543210");
+        assert_eq!(msg.sender.display_name, "Alena");
+
+        // The numeric Telegram user_id is exposed in metadata as a string.
+        let tg_id = msg
+            .metadata
+            .get("telegram_user_id")
+            .and_then(|v| v.as_str())
+            .expect("telegram_user_id should be present in metadata");
+        assert_eq!(tg_id, "554772934");
+    }
+
+    #[tokio::test]
+    async fn test_parse_sender_chat_user_id_metadata() {
+        // When a message arrives via `sender_chat` (channel/group posting on
+        // its own behalf), the chat id is what we have — surface it under
+        // `telegram_user_id` so the metadata key is always present.
+        let update = serde_json::json!({
+            "update_id": 556,
+            "message": {
+                "message_id": 2,
+                "sender_chat": {
+                    "id": -1001234567890_i64,
+                    "type": "channel",
+                    "title": "My Channel"
+                },
+                "chat": {
+                    "id": -1001234567890_i64,
+                    "type": "channel"
+                },
+                "date": 1700000001,
+                "text": "Broadcast"
+            }
+        });
+
+        let client = test_client();
+        let msg = parse_telegram_update(&update, &[], "fake:token", &client, DEFAULT_API_URL, None)
+            .await
+            .unwrap();
+
+        let tg_id = msg
+            .metadata
+            .get("telegram_user_id")
+            .and_then(|v| v.as_str())
+            .expect("telegram_user_id should be present in metadata");
+        assert_eq!(tg_id, "-1001234567890");
     }
 
     #[tokio::test]
@@ -2051,10 +2154,7 @@ mod tests {
                         body,
                     )
                 } else {
-                    (
-                        StatusCode::OK,
-                        r#"{"ok":true,"result":true}"#.to_string(),
-                    )
+                    (StatusCode::OK, r#"{"ok":true,"result":true}"#.to_string())
                 }
             }
         }));
@@ -2131,7 +2231,10 @@ mod tests {
         // Two-chunk message; first POST fails. Nothing delivered → Err.
         let big = "a".repeat(5000); // > 4096 → split into two chunks
         let stub = StubServer::new(vec![
-            (500, r#"{"ok":false,"error_code":500,"description":"server"}"#),
+            (
+                500,
+                r#"{"ok":false,"error_code":500,"description":"server"}"#,
+            ),
             (200, r#"{"ok":true,"result":{}}"#),
         ]);
         let base = spawn_stub_server(stub.clone()).await;
@@ -2159,7 +2262,10 @@ mod tests {
         let big = "a".repeat(5000);
         let stub = StubServer::new(vec![
             (200, r#"{"ok":true,"result":{}}"#),
-            (400, r#"{"ok":false,"error_code":400,"description":"some err"}"#),
+            (
+                400,
+                r#"{"ok":false,"error_code":400,"description":"some err"}"#,
+            ),
         ]);
         let base = spawn_stub_server(stub.clone()).await;
         let adapter = test_adapter(base);
@@ -2170,7 +2276,11 @@ mod tests {
             result.is_ok(),
             "partial delivery must return Ok (best-effort), got {result:?}"
         );
-        assert_eq!(stub.hit_count(), 2, "both chunks should have been attempted");
+        assert_eq!(
+            stub.hit_count(),
+            2,
+            "both chunks should have been attempted"
+        );
     }
 
     // -----------------------------------------------------------------------
